@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from rich.progress import (BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn,
                            TimeRemainingColumn, TransferSpeedColumn)
@@ -18,16 +20,38 @@ from rich.progress import (BarColumn, DownloadColumn, Progress, SpinnerColumn, T
 from .api import CanvasError
 
 ATTR = re.compile(r"""(\b(?:href|src)\s*=\s*)(["'])(.*?)\2""", re.I | re.S)
-FILE_REF = re.compile(r"/files/(\d+)")
 EXT = re.compile(r"\.[A-Za-z0-9]{1,5}$")
+MANIFEST = ".canvas-dl.json"
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+PLAN_ERRORS = (CanvasError, KeyError, TypeError, ValueError)  # odd or missing fields from Canvas
 
 
-def safe(name, limit=120):
-    """Make a string usable as a file or folder name on any OS."""
+def _clip(text, limit):
+    """Cut to at most `limit` UTF-8 bytes (filesystems count bytes, not characters)."""
+    data = text.encode("utf-8")
+    return text if len(data) <= limit else data[:limit].decode("utf-8", "ignore")
+
+
+def safe(name, limit=150, keep_ext=True):
+    """Make a string usable as a file or folder name on any OS, keeping its extension."""
     name = re.sub(r"\s*:\s+", " - ", str(name))  # "LO1: Basics" -> "LO1 - Basics"
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
-    return name[:limit].rstrip(" .") or "untitled"
+    ext = EXT.search(name) if keep_ext else None
+    ext = ext.group(0) if ext else ""
+    stem = name[:len(name) - len(ext)] if ext else name
+    name = (_clip(stem, limit - len(ext.encode())).rstrip(" .") or "untitled") + ext
+    if name.split(".")[0].upper() in RESERVED:  # Windows can't create these
+        name = "_" + name
+    return name
+
+
+def with_ext(name, filename):
+    """Add the real file's extension to a display name that lacks it."""
+    ext = EXT.search(filename or "")
+    if ext and not name.lower().endswith(ext.group(0).lower()):
+        name += ext.group(0)
+    return name
 
 
 def course_title(course):
@@ -46,8 +70,23 @@ def fmt_date(iso):
     return f"{dt:%a} {dt.day} {dt:%b %Y, %H:%M}"
 
 
+def timestamp(iso):
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def fmt_number(x):
+    return int(x) if isinstance(x, float) and x.is_integer() else x
+
+
 def rel(target, start):
     return quote(os.path.relpath(target, start).replace(os.sep, "/"))
+
+
+class _Cancelled(Exception):
+    pass
 
 
 @dataclass
@@ -57,11 +96,12 @@ class FileJob:
     url: str
     dest: Path
     size: int
+    modified: Optional[float] = None
 
 
 @dataclass
 class Entry:
-    kind: str                            # header, file, page, assignment, quiz, discussion, link
+    kind: str                              # header, file, page, assignment, quiz, discussion, link
     title: str
     target: Union[Path, str, None] = None  # local Path, or a URL
     note: str = ""
@@ -83,19 +123,28 @@ class CourseDownload:
         self.cid = str(course["id"])
         self.title = course_title(course)
         self.jobs: dict[str, Optional[FileJob]] = {}
-        self.used: set[Path] = set()
+        self.local: dict[tuple, Path] = {}  # (kind, key) of Canvas URLs we saved -> local path
+        self.used: set[str] = set()
         self.docs: list[Doc] = []
         self.modules: list[tuple[str, Path, list[Entry]]] = []
         self.problems: list[str] = []
         self.downloaded = 0
         self.up_to_date = 0
+        try:
+            self.manifest = json.loads((self.root / MANIFEST).read_text(encoding="utf-8"))
+            if not isinstance(self.manifest, dict):
+                raise ValueError
+        except (OSError, ValueError):
+            self.manifest = {}
+        self.old_files = self.manifest.get("files") or {}  # file id -> path, from last time
+        self.owner = {os.path.normcase(p): fid for fid, p in self.old_files.items()}
 
     # ---- planning: ask Canvas what's there, decide where it goes ----
 
     def plan(self, modules, status=lambda text: None):
         for m in modules:
             status(m["name"])
-            folder = self.root / safe(m["name"])
+            folder = self._unique(self.root / safe(m["name"], keep_ext=False))
             items = m.get("items")
             if items is None:  # Canvas leaves them out for very large modules
                 items = self.api.all(f"/courses/{self.cid}/modules/{m['id']}/items")
@@ -107,38 +156,45 @@ class CourseDownload:
                     continue
                 n += 1
                 try:
-                    entries.append(self._item(it, kind, title, folder, f"{n:02d} - "))
-                except CanvasError as e:
-                    self.problems.append(f"{title}: {e}")
-                    entries.append(Entry("link", title, it.get("html_url"), "not available"))
+                    entry = self._item(it, kind, title, folder, f"{n:02d} - ")
+                except PLAN_ERRORS as e:
+                    why = f"Canvas left out '{e.args[0]}'" if isinstance(e, KeyError) else str(e)
+                    self.problems.append(f"{title}: {why}")
+                    entry = Entry("link", title, it.get("html_url"), "not available")
+                if isinstance(entry.target, Path) and it.get("id"):
+                    self.local[("item", str(it["id"]))] = entry.target
+                entries.append(entry)
             self.modules.append((m["name"], folder, entries))
 
     def _item(self, it, kind, title, folder, pre):
-        api, cid, cid_id = self.api, self.cid, it.get("content_id")
+        api, cid, content = self.api, self.cid, it.get("content_id")
         if kind == "File":
-            job = self._file(cid_id, folder, pre, title)
+            job = self._file(content, folder, pre, title, name=title)
             return Entry("file", title, job.dest if job else it.get("html_url"), "" if job else "not available")
         if kind == "Page":
             x = api.get(f"/courses/{cid}/pages/{it['page_url']}")[1]
             body = x.get("body") or x.get("lock_explanation") or ""
-            return self._doc(folder, pre, title, "page", body, [], it.get("html_url"))
+            return self._doc(folder, pre, title, "page", body, [], it.get("html_url"), ("page", it["page_url"]))
         if kind == "Assignment":
-            x = api.get(f"/courses/{cid}/assignments/{cid_id}")[1]
+            x = api.get(f"/courses/{cid}/assignments/{content}")[1]
             facts = [("Due", fmt_date(x.get("due_at")) or "No due date"),
-                     ("Points", x.get("points_possible")),
+                     ("Points", fmt_number(x.get("points_possible"))),
                      ("Submission", ", ".join(s.replace("_", " ") for s in x.get("submission_types") or []))]
             body = x.get("description") or x.get("lock_explanation") or ""
-            return self._doc(folder, pre, title, "assignment", body, facts, it.get("html_url"))
+            return self._doc(folder, pre, title, "assignment", body, facts, it.get("html_url"),
+                             ("assignments", str(content)))
         if kind == "Quiz":
-            x = api.get(f"/courses/{cid}/quizzes/{cid_id}")[1]
+            x = api.get(f"/courses/{cid}/quizzes/{content}")[1]
             facts = [("Due", fmt_date(x.get("due_at")) or "No due date"),
                      ("Questions", x.get("question_count")),
                      ("Time limit", f"{x['time_limit']} min" if x.get("time_limit") else "None")]
-            return self._doc(folder, pre, title, "quiz", x.get("description") or "", facts, it.get("html_url"))
+            return self._doc(folder, pre, title, "quiz", x.get("description") or "", facts, it.get("html_url"),
+                             ("quizzes", str(content)))
         if kind == "Discussion":
-            x = api.get(f"/courses/{cid}/discussion_topics/{cid_id}")[1]
+            x = api.get(f"/courses/{cid}/discussion_topics/{content}")[1]
             facts = [("Posted", fmt_date(x.get("posted_at")))]
-            return self._doc(folder, pre, title, "discussion", x.get("message") or "", facts, it.get("html_url"))
+            return self._doc(folder, pre, title, "discussion", x.get("message") or "", facts, it.get("html_url"),
+                             ("discussion_topics", str(content)))
         if kind == "ExternalUrl":
             return Entry("link", title, it.get("external_url") or it.get("html_url"))
         if kind == "ExternalTool":
@@ -147,13 +203,13 @@ class CourseDownload:
 
     def _unique(self, path):
         stem, suffix, n = path.stem, path.suffix, 2
-        while path in self.used:
+        while str(path).lower() in self.used:  # case-insensitive filesystems
             path = path.with_name(f"{stem} ({n}){suffix}")
             n += 1
-        self.used.add(path)
+        self.used.add(str(path).lower())
         return path
 
-    def _file(self, fid, folder, prefix="", context=""):
+    def _file(self, fid, folder, prefix="", context="", name=None):
         fid = str(fid)
         if fid in self.jobs:
             return self.jobs[fid]
@@ -163,30 +219,89 @@ class CourseDownload:
         except CanvasError as e:
             self.problems.append(f"{context or 'File ' + fid}: {e}")
             return None
-        name = f.get("display_name") or f.get("filename") or fid
-        ext = EXT.search(f.get("filename") or "")
-        if ext and not EXT.search(name):  # display names sometimes drop the extension
-            name += ext.group(0)
+        filename = f.get("filename") or ""
+        name = with_ext(name or f.get("display_name") or filename or fid, filename)
         if not f.get("url"):
             self.problems.append(f"{name}: locked or not released yet")
             return None
-        job = FileJob(fid, name, f["url"], self._unique(folder / safe(prefix + name)), f.get("size") or 0)
+        job = FileJob(fid, name, f["url"], self._unique(folder / safe(prefix + name)), f.get("size") or 0,
+                      timestamp(f.get("modified_at") or f.get("updated_at")))
         self.jobs[fid] = job
         return job
 
-    def _doc(self, folder, pre, title, kind, body, facts, url):
-        path = self._unique(folder / (safe(pre + title, 115) + ".html"))
-        for fid in dict.fromkeys(FILE_REF.findall(body)):
-            self._file(fid, folder / "attachments", context=f"File linked from “{title}”")
+    def _doc(self, folder, pre, title, kind, body, facts, url, key):
+        path = self._unique(folder / (safe(pre + title, 145, keep_ext=False) + ".html"))
+        self.local[key] = path
+        for ref in self._refs(body):
+            if ref[0] == "files":
+                self._file(ref[1], folder / "attachments", context=f"File linked from “{title}”")
         self.docs.append(Doc(path, title, kind, body, [(k, v) for k, v in facts if v not in (None, "")], url))
         return Entry(kind, title, path)
 
+    # ---- links inside pages ----
+
+    def _ref(self, url):
+        """('files', id), ('page', slug), ('item', id)… if url points into this Canvas, else None."""
+        u = urlparse(html.unescape(url))
+        if u.scheme not in ("", "http", "https") or (u.netloc and u.hostname != self.api.host):
+            return None
+        m = re.search(r"/files/(\d+)", u.path)
+        if m:
+            return ("files", m.group(1))
+        m = re.search(rf"/courses/{self.cid}/(pages)/([^/]+)/?$", u.path)
+        if m:
+            return ("page", unquote(m.group(2)))
+        m = re.search(rf"/courses/{self.cid}/(assignments|quizzes|discussion_topics)/(\d+)/?$", u.path)
+        if m:
+            return (m.group(1), m.group(2))
+        m = re.search(rf"/courses/{self.cid}/modules/items/(\d+)/?$", u.path)
+        if m:
+            return ("item", m.group(1))
+        return None
+
+    def _refs(self, body):
+        return [r for r in (self._ref(m.group(3)) for m in ATTR.finditer(body or "")) if r]
+
+    def _rewrite(self, body, here):
+        """Point links at local copies; make Canvas-relative links absolute."""
+        def sub(m):
+            raw = html.unescape(m.group(3))
+            ref = self._ref(raw)
+            target = None
+            if ref and ref[0] == "files":
+                job = self.jobs.get(ref[1])
+                target = job.dest if job else None
+            elif ref:
+                target = self.local.get(ref)
+            if target:
+                new = rel(target, here.parent)
+            elif raw.startswith("//"):
+                new = "https:" + raw
+            elif raw.startswith("/"):
+                new = self.api.base + raw
+            else:
+                return m.group(0)
+            return f"{m.group(1)}{m.group(2)}{html.escape(new)}{m.group(2)}"
+        return ATTR.sub(sub, body or "")
+
     # ---- writing pages, the index and links.md ----
 
+    def _in_this_run(self, path):
+        folders = {f for _n, f, _e in self.modules}
+        return any(f == path.parent or f in path.parents for f in folders)
+
     def write(self):
+        new_docs = {str(d.path) for d in self.docs}
+        for old in self.manifest.get("docs", []):  # pages renamed or removed since last time
+            p = self.root / old
+            if str(p) not in new_docs and self._in_this_run(p) and p.suffix == ".html" and p.is_file():
+                p.unlink()
         for doc in self.docs:
-            doc.path.parent.mkdir(parents=True, exist_ok=True)
-            doc.path.write_text(self._render_doc(doc), encoding="utf-8")
+            try:
+                doc.path.parent.mkdir(parents=True, exist_ok=True)
+                doc.path.write_text(self._render_doc(doc), encoding="utf-8")
+            except OSError as e:
+                self.problems.append(f"{doc.title}: couldn't save the page ({e.strerror or e})")
         for name, folder, entries in self.modules:
             links = [e for e in entries if e.kind in ("header", "link", "quiz")]
             if any(e.kind != "header" for e in links):
@@ -203,25 +318,11 @@ class CourseDownload:
                     else:
                         lines.append(f"- [{e.title}]({e.target})" + (f" ({e.note})" if e.note else ""))
                 (folder / "links.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.write_index()
+
+    def write_index(self):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "index.html").write_text(self._render_index(), encoding="utf-8")
-
-    def _rewrite(self, body, here):
-        """Point links at local copies; make Canvas-relative links absolute."""
-        def sub(m):
-            raw = html.unescape(m.group(3))
-            ref = FILE_REF.search(raw)
-            job = self.jobs.get(ref.group(1)) if ref else None
-            if job:
-                new = rel(job.dest, here.parent)
-            elif raw.startswith("//"):
-                new = "https:" + raw
-            elif raw.startswith("/"):
-                new = self.api.base + raw
-            else:
-                return m.group(0)
-            return f"{m.group(1)}{m.group(2)}{html.escape(new)}{m.group(2)}"
-        return ATTR.sub(sub, body or "")
 
     def _render_doc(self, doc):
         e = html.escape
@@ -244,7 +345,10 @@ class CourseDownload:
                 if en.kind == "header":
                     rows.append(f'<li class="sub">{e(en.title)}</li>')
                     continue
-                if isinstance(en.target, Path):
+                if isinstance(en.target, Path) and not en.target.exists():
+                    href, ext, tag = "#", "", "Missing"
+                    en = Entry(en.kind, en.title, None, "not downloaded; see the end of the run")
+                elif isinstance(en.target, Path):
                     href, ext = rel(en.target, self.root), ""
                     tag = en.target.suffix.lstrip(".").upper() if en.kind == "file" else en.kind.title()
                 else:
@@ -263,12 +367,44 @@ class CourseDownload:
 
     # ---- downloading ----
 
+    def _current(self, job):
+        """True if the local copy is this file (same size, not older than the upload)."""
+        owner = self.owner.get(os.path.normcase(os.path.relpath(job.dest, self.root)))
+        if owner and owner != job.fid:  # last time this name held a different file
+            return False
+        try:
+            st = job.dest.stat()
+        except OSError:
+            return False
+        if job.size and st.st_size != job.size:
+            return False
+        return not job.modified or st.st_mtime >= job.modified - 2
+
+    def _reuse(self, job):
+        """If last run saved this file under another name (items got renumbered), move it."""
+        old = self.old_files.get(job.fid)
+        if not old or job.dest.exists():
+            return False
+        src = self.root / old
+        if src == job.dest or not src.is_file() or (job.size and src.stat().st_size != job.size):
+            return False
+        job.dest.parent.mkdir(parents=True, exist_ok=True)
+        src.replace(job.dest)
+        return self._current(job)
+
     def fetch(self, console, workers=4):
         jobs = [j for j in self.jobs.values() if j]
-        todo = [j for j in jobs if not (j.dest.exists() and (not j.size or j.dest.stat().st_size == j.size))]
-        self.up_to_date = len(jobs) - len(todo)
-        if not todo:
-            return
+        try:
+            todo = [j for j in jobs if not (self._current(j) or self._reuse(j))]
+            self.up_to_date = len(jobs) - len(todo)
+            if todo:
+                self._download(todo, console, workers)
+        finally:
+            self._save_manifest(jobs)
+            self.write_index()
+
+    def _download(self, todo, console, workers):
+        stop = threading.Event()
         columns = (SpinnerColumn(), TextColumn("{task.description}", markup=False), BarColumn(),
                    DownloadColumn(), TransferSpeedColumn(), TimeRemainingColumn())
         with Progress(*columns, console=console) as prog:
@@ -279,20 +415,46 @@ class CourseDownload:
                 task = prog.add_task("  " + name, total=job.size or None)
 
                 def step(n):
+                    if stop.is_set():
+                        raise _Cancelled
                     prog.advance(task, n)
                     prog.advance(total, n)
                 try:
                     job.dest.parent.mkdir(parents=True, exist_ok=True)
-                    self.api.download(job.url, job.dest, step)
+                    self.api.download(job.url, job.dest, step, job.size)
+                    if job.modified:
+                        os.utime(job.dest, (job.modified, job.modified))
                     return 1
+                except _Cancelled:
+                    return 0
                 except (CanvasError, OSError) as e:
                     self.problems.append(f"{job.name}: {e}")
                     return 0
                 finally:
                     prog.remove_task(task)
 
-            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-                self.downloaded = sum(pool.map(work, todo))
+            pool = ThreadPoolExecutor(max_workers=max(1, workers or 1))
+            try:
+                for fut in as_completed([pool.submit(work, j) for j in todo]):
+                    self.downloaded += fut.result()
+            except BaseException:
+                stop.set()  # make running downloads stop at their next chunk
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+
+    def _save_manifest(self, jobs):
+        files = {j.fid: os.path.relpath(j.dest, self.root) for j in jobs if j.dest.is_file()}
+        taken = {os.path.normcase(p) for p in files.values()}
+        kept = {fid: p for fid, p in self.old_files.items() if fid not in files and os.path.normcase(p) not in taken}
+        docs = [os.path.relpath(d.path, self.root) for d in self.docs]
+        docs += [p for p in self.manifest.get("docs", []) if not self._in_this_run(self.root / p) and p not in docs]
+        data = {"version": 1, "course": self.cid, "files": {**kept, **files}, "docs": docs}
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            (self.root / MANIFEST).write_text(json.dumps(data, indent=1), encoding="utf-8")
+        except OSError:
+            pass
 
     @property
     def file_count(self):

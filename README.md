@@ -85,11 +85,11 @@ How long a sign-in lasts is up to your school. Some keep you signed in for weeks
 Each course is saved to `<download folder>/<Course name>/<Module name>/`, with items in module order and `01 - `, `02 - `, and so on as prefixes.
 
 - **Files**: PDFs, slides, documents, Packet Tracer files, videos uploaded to Canvas, and similar.
-- **Pages, assignment descriptions, quiz intros and discussion prompts** as clean, readable HTML pages that work offline. Links to course files point to the local copies in an `attachments/` folder, and images are saved locally too.
+- **Pages, assignment descriptions, quiz intros and discussion prompts** as clean, readable HTML pages that work offline. Course files and images uploaded to Canvas that they link to are saved in an `attachments/` folder, and the links point to those copies. Links between pages of the course open the local copies too. Images hosted on other websites still load from the web.
 - **`links.md`** in each module, listing external links, external tools and quizzes. Quizzes must be taken in Canvas.
 - **`index.html`** in each course: a table of contents of every module and item, linking to the local copies. Open it in a browser to study offline.
 
-Re-running a download skips files you already have with the same size. Items that are locked or hidden by the teacher are listed at the end of the run instead of being silently dropped.
+Re-running a download only fetches files that are new or that the teacher has replaced. If items move around in a module, files are renamed instead of downloaded again. A small `.canvas-dl.json` file in each course folder keeps track of this. Items that are locked or hidden by the teacher are listed at the end of the run instead of being silently dropped.
 
 Example:
 
@@ -122,7 +122,7 @@ Set the `CANVAS_DL_HOME` environment variable to use a different location.
 
 ## Privacy & security
 
-- The session is stored in `session.json`, which holds your Canvas login cookies. It is readable only by you. Treat it like a password.
+- The session is stored in `session.json`. It holds only your Canvas login cookies, not your school's single sign-on ones, and is readable only by you. Treat it like a password.
 - `canvas-dl logout` deletes `session.json`.
 - Sessions expire like normal Canvas logins. When one expires, sign in again.
 - canvas-dl only sends GET requests to Canvas. It never submits, posts or changes anything.
@@ -131,7 +131,7 @@ Set the `CANVAS_DL_HOME` environment variable to use a different location.
 
 There are good Chrome extensions that also use your browser session, such as "Canvas Course Downloader & Exporter". canvas-dl is terminal-first. It:
 
-- works on Linux, on servers and over SSH (after one sign-in),
+- works on Linux, macOS and Windows, including from scripts and cron jobs (signing in needs a screen once; after that downloads run without one),
 - is scriptable and cron-friendly, with incremental sync,
 - produces a browsable offline copy with working links between pages and files.
 

@@ -1,7 +1,6 @@
 """The interactive menu shown when canvas-dl runs with no arguments."""
 
 from itertools import groupby
-from pathlib import Path
 
 import questionary as q
 from questionary import Choice, Separator, Style
@@ -11,7 +10,7 @@ from rich.panel import Panel
 
 from . import __version__, auth, config, core
 from .api import CanvasError, SessionExpired
-from .download import course_title
+from .download import course_title, timestamp
 
 STYLE = Style([
     ("qmark", "fg:#e0533d bold"),
@@ -29,7 +28,7 @@ BACK = "__back__"
 
 
 def ask(question):
-    """Run a prompt; Ctrl+C or Esc means 'go back' (None)."""
+    """Run a prompt; Ctrl+C means 'go back' (None)."""
     try:
         return question.unsafe_ask()
     except KeyboardInterrupt:
@@ -50,7 +49,7 @@ class App:
             signed_in = config.signed_in(self.cfg)
             choices = []
             if signed_in:
-                n = len(self.cfg["downloads"])
+                n = len(core.tracked(self.cfg))
                 choices.append(Choice("Download courses", "download"))
                 choices.append(Choice(f"Update downloads ({n} course{'s' if n != 1 else ''})", "update")
                                if n else Choice("Update downloads", "update", disabled="nothing downloaded yet"))
@@ -68,6 +67,9 @@ class App:
                 getattr(self, f"do_{action}")()
             except KeyboardInterrupt:
                 self.console.print("\n[yellow]Cancelled.[/]")
+            except SessionExpired as e:
+                self.api = None  # the next action asks you to sign in again
+                self.console.print(f"[red]✗[/] {escape(str(e))} You'll be asked to sign in again next time.")
             except (auth.LoginError, CanvasError) as e:
                 self.console.print(f"[red]✗[/] {escape(str(e))}")
             if action != "settings":
@@ -134,11 +136,17 @@ class App:
                                " Finished courses are hidden. Turn them on in Settings."))
             return
         choices = []
-        term = lambda c: (c.get("term") or {}).get("name") or "Other"
-        for name, group in groupby(courses, key=term):
+
+        def term(c):
+            return (c.get("term") or {}).get("name") or "Other"
+
+        def newest_first(c):
+            t = c.get("term") or {}
+            return (-(timestamp(t.get("start_at")) or 0), term(c), c["name"].lower())
+        for name, group in groupby(sorted(courses, key=newest_first), key=term):
             choices.append(Separator(f"── {name} "))
             for c in group:
-                done = str(c["id"]) in self.cfg["downloads"]
+                done = str(c["id"]) in core.tracked(self.cfg)
                 title = [("", c["name"])] + ([("class:instruction", "  ✓ downloaded")] if done else [])
                 choices.append(Choice(title, c))
         picked = ask(q.checkbox("Which courses?", choices, style=STYLE,
@@ -174,26 +182,21 @@ class App:
         out = ask(q.path("Save to:", default=self.cfg["out"], only_directories=True, style=STYLE))
         if not out:
             return
+        out = core.absolute(out)
         if out != self.cfg["out"]:
             self.cfg["out"] = out
             config.save(self.cfg)
         self.console.print()
         for c, ids in plan:
-            core.summary(self.console, core.sync_course(api, self.cfg, c, ids, out, self.console))
+            try:
+                core.summary(self.console, core.sync_course(api, self.cfg, c, ids, out, self.console))
+            except SessionExpired:
+                raise
+            except CanvasError as e:
+                self.console.print(f"[yellow]Skipping {escape(course_title(c))}: {escape(str(e))}[/]")
 
     def do_update(self):
-        api = self.connect()
-        for cid, rec in list(self.cfg["downloads"].items()):
-            try:
-                course = api.course(cid)
-            except CanvasError as e:
-                if isinstance(e, SessionExpired):
-                    raise
-                self.console.print(f"[yellow]Skipping {escape(rec.get('name', cid))}: {escape(str(e))}[/]")
-                continue
-            ids = None if rec.get("modules") == "all" else rec.get("modules")
-            core.summary(self.console, core.sync_course(api, self.cfg, course, ids,
-                                                        rec.get("out") or self.cfg["out"], self.console))
+        core.update_all(self.connect(), self.cfg, self.console)
 
     def do_settings(self):
         last = None
@@ -211,7 +214,7 @@ class App:
             if choice == "out":
                 v = ask(q.path("Download folder:", default=self.cfg["out"], only_directories=True, style=STYLE))
                 if v:
-                    self.cfg["out"] = v
+                    self.cfg["out"] = core.absolute(v)
             elif choice == "workers":
                 v = ask(q.select("Parallel downloads:", [str(n) for n in (1, 2, 4, 6, 8)],
                                  default=str(self.cfg["workers"]) if self.cfg["workers"] in (1, 2, 4, 6, 8) else None,

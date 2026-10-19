@@ -31,6 +31,27 @@ def course_and_module(arg):
     raise SystemExit(f"canvas-dl: can't find a course id in {arg!r} (use the number or the course URL)")
 
 
+def pick_module(mods, want, cid):
+    """Match by id, then exact name, then a name fragment that fits exactly one module."""
+    w = want.strip().lower()
+    for test in (lambda m: str(m["id"]) == w, lambda m: m["name"].strip().lower() == w,
+                 lambda m: w in m["name"].lower()):
+        hits = [m for m in mods if test(m)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            names = "\n".join(f"  {m['id']:>8}  {m['name']}" for m in hits)
+            raise SystemExit(f"canvas-dl: {want!r} matches several modules; use the id or more of the name:\n{names}")
+    raise SystemExit(f"canvas-dl: no module matches {want!r}. List them with: canvas-dl modules {cid}")
+
+
+def positive(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
 def cmd_login(a, cfg, out):
     base = auth.normalise_url(a.url)
     out.print(f"Opening a browser at {escape(base)}. Sign in there; it closes by itself once you're in.")
@@ -68,32 +89,17 @@ def cmd_get(a, cfg, out):
     ids = None
     if wanted:
         mods = api.modules(cid)
-        ids = []
-        for w in wanted:
-            hits = [m["id"] for m in mods if str(m["id"]) == w or w.lower() in m["name"].lower()]
-            if not hits:
-                raise SystemExit(f"canvas-dl: no module matches {w!r}. List them with: canvas-dl modules {cid}")
-            ids += hits
+        ids = [pick_module(mods, w, cid)["id"] for w in wanted]
     job = core.sync_course(api, cfg, course, list(dict.fromkeys(ids)) if ids else None,
                            a.out or cfg["out"], out, a.jobs)
     core.summary(out, job)
 
 
 def cmd_update(a, cfg, out):
-    if not cfg["downloads"]:
+    if not core.tracked(cfg):
         out.print("Nothing downloaded yet. Use `canvas-dl get` or the menu first.")
         return
-    api = core.connect(cfg)
-    for cid, rec in list(cfg["downloads"].items()):
-        try:
-            course = api.course(cid)
-        except SessionExpired:
-            raise
-        except CanvasError as e:
-            out.print(f"[yellow]Skipping {escape(rec.get('name', cid))}: {escape(str(e))}[/]")
-            continue
-        ids = None if rec.get("modules") == "all" else rec.get("modules")
-        core.summary(out, core.sync_course(api, cfg, course, ids, rec.get("out") or cfg["out"], out, a.jobs))
+    core.update_all(core.connect(cfg), cfg, out, a.jobs)
 
 
 def cmd_install_browser(a, cfg, out):
@@ -124,10 +130,10 @@ def main(argv=None):
     s.add_argument("-m", "--module", action="append", metavar="NAME|ID",
                    help="only this module (name fragment or id); repeatable. Default: all")
     s.add_argument("-o", "--out", metavar="DIR", help="download folder (default from settings)")
-    s.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel downloads")
+    s.add_argument("-j", "--jobs", type=positive, metavar="N", help="parallel downloads")
     s.set_defaults(f=cmd_get)
     s = sub.add_parser("update", help="re-sync everything downloaded before")
-    s.add_argument("-j", "--jobs", type=int, metavar="N", help="parallel downloads")
+    s.add_argument("-j", "--jobs", type=positive, metavar="N", help="parallel downloads")
     s.set_defaults(f=cmd_update)
 
     s = sub.add_parser("install-browser", help="download a browser for signing in, if you have no Chrome/Chromium/Edge")

@@ -1,8 +1,10 @@
 """Sign in through a real browser window and save the session."""
 
+import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -71,6 +73,7 @@ def login(base):
 
     config.ensure_dir()
     closed = LoginError("The browser was closed before sign-in finished.")
+    deadline = time.monotonic() + 15 * 60
     with sync_playwright() as p:
         browser = _launch(p)
         try:
@@ -83,15 +86,27 @@ def login(base):
             while True:
                 if page.is_closed() or not browser.is_connected():
                     raise closed
+                if time.monotonic() > deadline:
+                    raise LoginError("Gave up waiting for sign-in after 15 minutes.")
                 try:
                     page.wait_for_timeout(1500)
                     r = ctx.request.get(base + "/api/v1/users/self")
+                    me = parse_json(r.text()) if r.ok else None
                 except PlaywrightError:
                     raise closed from None
-                if r.ok:
-                    me = parse_json(r.text())
+                except ValueError:  # a 200 that isn't Canvas JSON, e.g. a proxy page
+                    me = None
+                if isinstance(me, dict) and me.get("id"):
                     break
-            ctx.storage_state(path=str(config.SESSION))
+            # keep only Canvas's own cookies, not the school's single sign-on ones
+            host = urlparse(base).hostname
+            state = ctx.storage_state()
+            state["cookies"] = [c for c in state["cookies"]
+                                if host == c["domain"].lstrip(".") or host.endswith("." + c["domain"].lstrip("."))]
+            state["origins"] = []
+            fd = os.open(config.SESSION, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(state, f)
         finally:
             try:
                 browser.close()

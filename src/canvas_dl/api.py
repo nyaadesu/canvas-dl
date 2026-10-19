@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -42,12 +43,24 @@ class Canvas:
             self.http.cookies.set(c["name"], c["value"], domain=c["domain"],
                                   path=c.get("path", "/"), secure=c.get("secure", False))
 
+    def _request(self, url, **kw):
+        """GET with a few retries for network blips, rate limiting and server errors."""
+        for attempt in range(4):
+            try:
+                r = self.http.get(url, timeout=60, **kw)
+            except requests.RequestException as e:
+                if attempt == 3:
+                    raise CanvasError(f"network error ({e.__class__.__name__})") from e
+            else:
+                throttled = r.status_code == 429 or (r.status_code == 403 and "Rate Limit" in r.text[:500])
+                if not (throttled or r.status_code >= 500) or attempt == 3:
+                    return r
+                r.close()
+            time.sleep(2 ** attempt)
+
     def get(self, path, params=None):
         url = path if path.startswith("http") else f"{self.base}/api/v1{path}"
-        try:
-            r = self.http.get(url, params=params, timeout=60)
-        except requests.RequestException as e:
-            raise CanvasError(f"network error ({e.__class__.__name__})") from e
+        r = self._request(url, params=params)
         if r.status_code == 401:
             # Canvas also uses 401 for "you can't see this", not only for logged out
             if "not authorized" in r.text:
@@ -67,8 +80,9 @@ class Canvas:
     def all(self, path, params=None):
         """GET every page of a paginated list."""
         params = dict(params or {}, per_page=100)
-        out, url = [], path
-        while url:
+        out, url, seen = [], path, set()
+        while url and url not in seen:
+            seen.add(url)
             r, data = self.get(url, params)
             out += data
             params = None  # the next link carries them
@@ -77,7 +91,10 @@ class Canvas:
         return out
 
     def me(self):
-        return self.get("/users/self")[1]
+        try:
+            return self.get("/users/self")[1]
+        except Forbidden:  # any refusal here means we're not signed in
+            raise SessionExpired("Your Canvas session has expired.") from None
 
     def course(self, cid):
         return self.get(f"/courses/{cid}", {"include[]": "term"})[1]
@@ -93,18 +110,25 @@ class Canvas:
     def modules(self, cid):
         return self.all(f"/courses/{cid}/modules", {"include[]": "items"})
 
-    def download(self, url, dest, progress=lambda n: None):
+    def download(self, url, dest, progress=lambda n: None, size=None):
         part = dest.with_name(dest.name + ".part")
         try:
-            with self.http.get(url, stream=True, timeout=60) as r:
+            with self._request(url, stream=True) as r:
                 if r.status_code in (401, 403):
                     raise Forbidden(f"not accessible ({r.status_code})")
                 if not r.ok:
                     raise CanvasError(f"download failed ({r.status_code})")
+                if urlparse(r.url).hostname == self.host and "text/html" in r.headers.get("content-type", "") \
+                        and not dest.suffix.lower().startswith(".htm"):
+                    raise SessionExpired("Canvas sent a web page instead of the file. Your session may have expired.")
+                written = 0
                 with open(part, "wb") as f:
                     for chunk in r.iter_content(1 << 16):
                         f.write(chunk)
+                        written += len(chunk)
                         progress(len(chunk))
+            if size and written != size:
+                raise CanvasError(f"incomplete download ({written} of {size} bytes)")
             part.replace(dest)
         except requests.RequestException as e:
             raise CanvasError(f"network error ({e.__class__.__name__})") from e

@@ -31,9 +31,19 @@ def ensure_dir():
 def load():
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
-        cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+        saved = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except OSError:
+        saved = {}
+    except ValueError:  # corrupt: keep a copy rather than overwrite it on the next save
+        try:
+            CONFIG.replace(CONFIG.with_name("config.json.bad"))
+        except OSError:
+            pass
+        saved = {}
+    if isinstance(saved, dict):
+        for key, default in DEFAULTS.items():  # ignore values of the wrong type
+            if key in saved and (default is None or isinstance(saved[key], type(default))):
+                cfg[key] = saved[key]
     return cfg
 
 

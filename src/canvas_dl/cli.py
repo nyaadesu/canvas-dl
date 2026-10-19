@@ -57,7 +57,7 @@ def cmd_login(a, cfg, out):
     out.print(f"Opening a browser at {escape(base)}. Sign in there; it closes by itself once you're in.")
     with out.status("Waiting for you to sign in… (Ctrl+C to cancel)"):
         me = auth.login(base)
-    cfg.update(base=base, user=me.get("name"))
+    cfg.update(base=base, user=(me.get("name") or "").strip() or None)
     config.save(cfg)
     out.print(f"[green]✓[/] Signed in as [bold]{escape(me.get('name') or '?')}[/]")
 

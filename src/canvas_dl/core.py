@@ -14,8 +14,9 @@ def connect(cfg):
     """A Canvas client for the saved session. Raises SessionExpired."""
     api = Canvas(cfg["base"])
     me = api.me()
-    if cfg.get("user") != me.get("name"):
-        cfg["user"] = me.get("name")
+    name = (me.get("name") or "").strip() or None
+    if cfg.get("user") != name:
+        cfg["user"] = name
         config.save(cfg)
     return api
 

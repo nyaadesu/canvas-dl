@@ -121,7 +121,7 @@ class App:
                            "it closes by itself once you're in.")
         with self.console.status("Waiting for you to sign in… [dim](Ctrl+C to cancel)[/]"):
             me = auth.login(base)
-        self.cfg.update(base=base, user=me.get("name"))
+        self.cfg.update(base=base, user=(me.get("name") or "").strip() or None)
         config.save(self.cfg)
         self.api = None
         self.console.print(f"[green]✓[/] Signed in as [bold]{escape(me.get('name') or '?')}[/]")

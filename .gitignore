@@ -22,3 +22,6 @@ htmlcov/
 
 # Partial downloads
 *.part
+
+# Canvas login cookies (treat like a password)
+session.json

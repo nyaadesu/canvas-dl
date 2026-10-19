@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "canvas-dl"
+dynamic = ["version"]
+description = "Download your Canvas LMS courses for offline study. Sign in with a normal browser window, no access token needed."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Ariel Hart" }]
+keywords = ["canvas", "lms", "instructure", "download", "offline", "study"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Education",
+]
+dependencies = [
+    "platformdirs>=3",
+    "playwright>=1.40",
+    "questionary>=2.0",
+    "requests>=2.28",
+    "rich>=13",
+]
+
+[project.urls]
+Homepage = "https://github.com/nyaadesu/canvas-dl"
+Issues = "https://github.com/nyaadesu/canvas-dl/issues"
+
+[project.scripts]
+canvas-dl = "canvas_dl.cli:main"
+
+[tool.hatch.version]
+path = "src/canvas_dl/__init__.py"

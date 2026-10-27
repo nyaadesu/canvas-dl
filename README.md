@@ -40,7 +40,7 @@ canvas-dl get 12345 -o ~/Canvas
 Run `canvas-dl` with no arguments to get an arrow-key menu:
 
 ```
-╭─ canvas-dl 0.1.0 ───────────────────────────────────╮
+╭─ canvas-dl 0.1.1 ───────────────────────────────────╮
 │ Signed in as Sam Student · myschool.instructure.com │
 ╰─────────────────────────────────────────────────────╯
 ? What would you like to do?

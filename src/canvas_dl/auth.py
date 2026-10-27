@@ -57,14 +57,18 @@ def _launch(p):
         attempts.append({"executable_path": os.environ["CANVAS_DL_BROWSER"]})
     attempts += [{}, {"channel": "chrome"}, {"channel": "msedge"}]
     attempts += [{"executable_path": b} for b in _system_browsers()]
+    last = None
     for kw in attempts:
         try:
-            return p.chromium.launch(headless=False, args=args, **kw)
-        except Exception:
-            continue
+            # Playwright's 30s default is too short for a cold start on a busy machine
+            return p.chromium.launch(headless=False, args=args, timeout=120_000, **kw)
+        except Exception as e:
+            last = e
+    detail = str(last).splitlines()[0] if last else ""
     raise LoginError(
         "Couldn't start a browser. Install Chrome, Edge or Chromium, or run "
-        "`canvas-dl install-browser`, or set CANVAS_DL_BROWSER to a Chromium-based browser.")
+        "`canvas-dl install-browser`, or set CANVAS_DL_BROWSER to a Chromium-based browser."
+        + (f"\n({detail})" if detail else ""))
 
 
 def login(base):
